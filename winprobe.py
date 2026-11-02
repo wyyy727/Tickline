@@ -18,9 +18,38 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 psapi = ctypes.WinDLL("psapi", use_last_error=True)
 
-# 模块名 → 标签。命中 nvngx_dlssg 就是 NVIDIA 的帧生成，命中 ffx 就是 AMD 的。
-_DLSS_MARKERS = ("nvngx_dlssg", "nvngx_dlss", "_nvngx")
-_FSR_MARKERS = ("ffx_fsr", "fidelityfx", "amd_fidelityfx_framegeneration", "fsr3")
+LIST_MODULES_ALL = 0x03
+# 不声明 argtypes 时句柄会被当 int 截断，模块数组的指针也会被猜错类型。
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+kernel32.CloseHandle.restype = wt.BOOL
+psapi.EnumProcessModulesEx.argtypes = [
+    wt.HANDLE,
+    ctypes.POINTER(wt.HMODULE),
+    wt.DWORD,
+    ctypes.POINTER(wt.DWORD),
+    wt.DWORD,
+]
+psapi.EnumProcessModulesEx.restype = wt.BOOL
+psapi.EnumProcessModules.argtypes = [
+    wt.HANDLE,
+    ctypes.POINTER(wt.HMODULE),
+    wt.DWORD,
+    ctypes.POINTER(wt.DWORD),
+]
+psapi.EnumProcessModules.restype = wt.BOOL
+psapi.GetModuleBaseNameW.argtypes = [wt.HANDLE, wt.HMODULE, wt.LPWSTR, wt.DWORD]
+psapi.GetModuleBaseNameW.restype = wt.DWORD
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+
+# 这个标签是给"帧生成"那一段用的，所以只认**帧生成**模块，不能只看超分：
+# nvngx_dlss.dll 是 DLSS 超分/光线重建，光开超分并不产生额外帧，标成 DLSS 会误导。
+# 同理 FSR 的帧生成在 amdxcffx64.dll（FSR3）里，旧标记漏了它。
+_DLSS_MARKERS = ("nvngx_dlssg",)               # DLSS Frame Generation
+_FSR_MARKERS = ("amdxcffx64", "ffx_fsr3", "fsr3")  # FSR3 Frame Generation
 
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
@@ -96,6 +125,21 @@ def _process_name(pid: int) -> str:
         kernel32.CloseHandle(wt.HANDLE(handle))
 
 
+def foreground_pid() -> int | None:
+    """当前前台窗口的进程 id；取不到（比如焦点在安全桌面）返回 None。
+
+    用来决定"自动"模式下该跟谁：玩家前台正开着的那个才是他想看的帧率，
+    比"谁出帧最忙"可靠 —— 浏览器、Steam 界面、微信都能在后台一直以 60 帧出帧，
+    按"最忙"选会选中它们，叠加层就永远显示一个不动的 60。
+    """
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    pid = wt.DWORD(0)
+    user32.GetWindowThreadProcessId(wt.HWND(hwnd), ctypes.byref(pid))
+    return pid.value or None
+
+
 def fullscreen_pids() -> list[FullscreenWindow]:
     """返回拥有"基本铺满显示器"的可见顶层窗口的进程。
 
@@ -152,7 +196,11 @@ def loaded_modules(pid: int) -> list[str]:
             continue
         try:
             needed = wt.DWORD(0)
-            if not psapi.EnumProcessModules(
+            # 优先用 Ex + LIST_MODULES_ALL：32 位游戏（很多 Unity/老引擎作品）从 64 位进程里
+            # 枚举模块时，普通 EnumProcessModules 只能看到 WOW64 层，拿不到游戏的真实模块。
+            if not psapi.EnumProcessModulesEx(
+                wt.HANDLE(handle), None, 0, ctypes.byref(needed), LIST_MODULES_ALL
+            ) and not psapi.EnumProcessModules(
                 wt.HANDLE(handle), None, 0, ctypes.byref(needed)
             ):
                 continue
@@ -160,7 +208,13 @@ def loaded_modules(pid: int) -> list[str]:
                 continue
             count = needed.value // ctypes.sizeof(wt.HMODULE)
             modules = (wt.HMODULE * max(1, count))()
-            if not psapi.EnumProcessModules(
+            if not psapi.EnumProcessModulesEx(
+                wt.HANDLE(handle),
+                modules,
+                ctypes.sizeof(modules),
+                ctypes.byref(needed),
+                LIST_MODULES_ALL,
+            ) and not psapi.EnumProcessModules(
                 wt.HANDLE(handle),
                 modules,
                 ctypes.sizeof(modules),
