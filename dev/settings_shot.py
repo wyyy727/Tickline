@@ -2,7 +2,7 @@
 
 import sys
 
-sys.path.insert(0, r"D:\workspace\pacecarnew\pacelite")
+sys.path.insert(0, r"D:\workspace\Tickline-space\Tickline")
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication

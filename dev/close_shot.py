@@ -2,7 +2,7 @@
 
 import sys
 
-sys.path.insert(0, r"D:\workspace\pacecarnew\pacelite")
+sys.path.insert(0, r"D:\workspace\Tickline-space\Tickline")
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
@@ -25,7 +25,7 @@ def main() -> int:
     window.show()
 
     def shoot() -> None:
-        window._refresh()
+        window._tick()
         window._hover = True   # 强制显示 ✕
         window.repaint()
         out = rf"D:\tmp\close_{cfg.font_size}.png"

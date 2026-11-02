@@ -3,7 +3,7 @@
 import sys
 import traceback
 
-sys.path.insert(0, r"D:\workspace\pacecarnew\pacelite")
+sys.path.insert(0, r"D:\workspace\Tickline-space\Tickline")
 
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QGuiApplication
@@ -49,7 +49,7 @@ step("窗口已显示")
 def shoot():
     try:
         step("截图：刷新数据")
-        window._refresh()
+        window._tick()
         QGuiApplication.processEvents()
         step(f"截图：窗口尺寸={window.size()}")
         ok = window.grab().save(r"D:\tmp\probe.png")

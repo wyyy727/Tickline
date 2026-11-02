@@ -2,7 +2,7 @@
 
 import sys
 
-sys.path.insert(0, r"D:\workspace\pacecarnew\pacelite")
+sys.path.insert(0, r"D:\workspace\Tickline-space\Tickline")
 
 from PySide6.QtWidgets import QApplication
 
@@ -19,7 +19,7 @@ def main() -> int:
     sampler.start()
     window = StripWindow(cfg, sampler, FakeFrameFeed())
     window.show()
-    window._refresh()
+    window._tick()
 
     print("屏幕清单:")
     for name, label in screen_choices():

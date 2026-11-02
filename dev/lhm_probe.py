@@ -2,7 +2,7 @@
 
 import sys
 
-LHM_DIR = r"D:\workspace\pacecarnew\tools\lhm"
+LHM_DIR = r"D:\workspace\Tickline-space\tools\lhm"
 sys.path.append(LHM_DIR)
 
 import clr

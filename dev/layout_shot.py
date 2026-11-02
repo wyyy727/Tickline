@@ -2,7 +2,7 @@
 
 import sys
 
-sys.path.insert(0, r"D:\workspace\pacecarnew\pacelite")
+sys.path.insert(0, r"D:\workspace\Tickline-space\Tickline")
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
@@ -32,7 +32,7 @@ def shoot(layout: str) -> None:
     window.show()
 
     def grab() -> None:
-        window._refresh()
+        window._tick()
         out = rf"D:\tmp\layout_{layout}.png"
         window.grab().save(out)
         print(f"[{layout}] 保存 {out} | 尺寸 {window.size().width()}x{window.size().height()}")
