@@ -36,6 +36,11 @@ HEADER_PRESENTS = "MsBetweenPresents"
 HEADER_DISPLAY = "MsBetweenDisplayChange"
 HEADER_APP = "Application"
 HEADER_PID = "ProcessID"
+# v2 指标（--v2_metrics）里没有上面那两个名字，同样的量叫 FrameTime / DisplayedTime。
+HEADER_PRESENTS_V2 = "FrameTime"
+HEADER_DISPLAY_V2 = "DisplayedTime"
+# 只有 v2 指标带这一列：区分"应用自己渲染的帧"和"驱动插出来的帧"。
+HEADER_FRAME_TYPE = "FrameType"
 
 
 def _column_index(header: list[str]) -> dict[str, int]:
@@ -293,6 +298,11 @@ class PresentMonFeed:
             "--session_name",
             SESSION_NAME,
             "--stop_existing_session",
+            # v1（默认）没有 FrameType 列，分不出"应用渲染的帧"和"驱动插出来的帧"，
+            # 帧生成倍率只能靠显示变帧率反推；v2 指标自带 FrameType，能直接分开算。
+            # 解析层同时认两套列名（HEADER_*_V2），所以换 v2 不影响别的。
+            "--v2_metrics",
+            "--track_frame_type",
         ]
         if self.target:
             args += ["--process_name", self.target]
@@ -472,28 +482,36 @@ class PresentMonFeed:
         return _decode_stderr(raw)
 
     def _handle_row(self, columns: dict[str, int], row: list[str]) -> None:
-        def field(name: str) -> str:
-            # 列的顺序会随 PresentMon 版本变，所以永远按表头查，不写死下标；
-            # 大小写也按归一化后的小写查（见 _column_index）。
-            index = columns.get(name.lower())
-            if index is None or index >= len(row):
-                return ""
-            return row[index].strip()
+        def field(*names: str) -> str:
+            # 列的顺序和名字都会随 PresentMon 版本变，所以永远按表头查，不写死下标；
+            # 大小写也按归一化后的小写查（见 _column_index）。给多个名字时取第一个有值的
+            # —— v1 的 MsBetweenPresents 和 v2 的 FrameTime 就是这么兼容的。
+            for name in names:
+                index = columns.get(name.lower())
+                if index is None or index >= len(row):
+                    continue
+                text = row[index].strip()
+                if text:
+                    return text
+            return ""
 
         now = time.monotonic()
         pid = _to_pid(field(HEADER_PID))
         if pid is None:
             return
         name = field(HEADER_APP)
-        present_ms = _to_float(field(HEADER_PRESENTS))
-        display_ms = _to_float(field(HEADER_DISPLAY))
+        present_ms = _to_float(field(HEADER_PRESENTS, HEADER_PRESENTS_V2))
+        display_ms = _to_float(field(HEADER_DISPLAY, HEADER_DISPLAY_V2))
+        frame_type = field(HEADER_FRAME_TYPE).strip().lower()
         with self._lock:
             if present_ms is not None:
                 lane = self._presents.get(pid)
                 if lane is None:
                     lane = deque(maxlen=_MAX_SAMPLES)
                     self._presents[pid] = lane
-                lane.append((now, present_ms, name))
+                # 第四格是 FrameType（v1 指标没有这一列，留空串），
+                # 用来把"应用渲染的帧"和"驱动插出来的帧"分开算帧率。
+                lane.append((now, present_ms, name, frame_type))
                 self._rows += 1
                 if self._rows == 1:
                     # 第一行原样记一笔：pid 解析对不对、单位是不是毫秒，一眼能看出来。
@@ -543,8 +561,17 @@ class PresentMonFeed:
         """纯读取：当前窗口内的两条帧率、历史最值与曲线。不推进任何状态。"""
         with self._lock:
             now = time.monotonic()
-            presented, target, frame_time, pid = self._active_rate(now)
+            presented, target, frame_time, pid, overall = self._active_rate(now)
             displayed = self._displayed_rate(pid, now)
+            # 显示那一路没数据、但 present 总数明显高于应用帧率时，说明确实在插帧：
+            # 用全部 present 的帧率兜底（每个 present 都会变成一次显示变帧）。
+            if (
+                displayed is None
+                and overall is not None
+                and presented is not None
+                and overall > presented * 1.05
+            ):
+                displayed = overall
             history = list(self._fps_history)
             # 最值跟着曲线走（最近约 30 秒），不是从启动到现在的全局最值：
             # 全局最值会把开局菜单那一下 144 帧永久钉在 ↑ 上，看起来就像卡住了。
@@ -635,8 +662,25 @@ class PresentMonFeed:
             f"[fps] 跟踪 {stats.target or '—'}({stats.pid if stats.pid is not None else '—'})"
             f" 原生={value(stats.presented_fps)} 显示={value(stats.displayed_fps)}"
             f" 标签={stats.fg_label} 理由={self._pick_reason or '—'} 前台={self._fg_hint or '—'}"
-            f" 候选=[{candidates}] 行数={self._rows}"
+            f" 类型={self._frame_type_summary(stats.pid)} 候选=[{candidates}] 行数={self._rows}"
         )
+
+    def _frame_type_summary(self, pid: int | None) -> str:
+        """最近一批帧的 FrameType 分布，排障用（v1 指标没这列，返回 "—"）。"""
+        if pid is None:
+            return "—"
+        with self._lock:
+            lane = self._presents.get(pid)
+            entries = list(lane)[-200:] if lane else []
+        counts: dict[str, int] = {}
+        for entry in entries:
+            if len(entry) <= 3:
+                continue
+            counts[entry[3] or "—"] = counts.get(entry[3] or "—", 0) + 1
+        if not counts:
+            return "—"
+        top = sorted(counts.items(), key=lambda item: -item[1])[:3]
+        return ",".join(f"{key}:{value}" for key, value in top)
 
     def _fg_label(self, pid: int | None, now: float) -> str:
         """缓存 10 秒的帧生成技术识别，识别不出就用 "FG"。"""
@@ -701,6 +745,50 @@ class PresentMonFeed:
         if count < 3 or total <= 0.0:
             return None
         return 1000.0 * count / total
+
+    @staticmethod
+    def _rates(samples) -> tuple[float | None, float | None]:
+        """(应用帧率, 全部 present 帧率)。样本不够时给 (None, None)。
+
+        开了帧生成时，present 里混着驱动插出来的帧，必须把它们剔掉，否则"原生帧率"
+        会等于显示帧率（实测 PBZ.exe：全部 present 87/s、显示 87/s，原生只有 44/s）。
+        两种识别方式：
+        1. v2 指标的 FrameType：插帧的 FrameType 不是 application，直接分开数；
+        2. 只有 v1 指标时看 present 间隔：插帧紧跟在真帧后面 present，间隔极小
+           （实测 0.5 ms 上下），而真帧之间是正常的一整帧时间（21 ms 上下）。
+           把明显偏小的间隔算作插帧，剩下的就是应用自己渲染的帧。
+        """
+        entries = list(samples)
+        if not entries:
+            return None, None
+        typed = [entry for entry in entries if len(entry) > 3 and entry[3]]
+        has_types = any(entry[3] != "application" for entry in typed)
+        total = 0.0
+        count = 0
+        app_count = 0
+        intervals: list[float] = []
+        for entry in reversed(entries):
+            total += entry[1]
+            count += 1
+            intervals.append(entry[1])
+            frame_type = entry[3] if len(entry) > 3 else ""
+            if not frame_type or frame_type == "application":
+                app_count += 1
+            if total >= _RATE_WINDOW_MS:
+                break
+        if count < 3 or total <= 0.0:
+            return None, None
+        overall = 1000.0 * count / total
+        if has_types:
+            if app_count < 3 or app_count >= count:
+                return overall, overall
+            return 1000.0 * app_count / total, overall
+        mean = total / count
+        threshold = max(1.5, mean * 0.4)  # 绝对下限 1.5 ms：正常帧不可能这么密
+        generated = sum(1 for interval in intervals if interval < threshold)
+        if generated < 2 or generated >= count - 1:
+            return overall, overall
+        return 1000.0 * (count - generated) / total, overall
 
     def _candidates(self, now: float) -> list[tuple[int, int, str]]:
         """[(最近几秒的到达条数, pid, 进程名)]，按条数降序。
@@ -777,20 +865,24 @@ class PresentMonFeed:
         self._pick_reason = "无数据"
         return None
 
-    def _active_rate(self, now: float) -> tuple[float | None, str, float | None, int | None]:
-        """选出目标进程并算它的应用帧率。
+    def _active_rate(
+        self, now: float
+    ) -> tuple[float | None, str, float | None, int | None, float | None]:
+        """选出目标进程，返回 (应用帧率, 进程名, 帧时间, pid, 全部 present 帧率)。
 
         显式指定了进程时只认它：没在出帧就返回 None，界面显示 "—"，
         而不是悄悄回落到别的进程让人以为选错了也能用。
+        应用帧率已经把插帧剔掉了（见 _rates）；第 5 个值是不剔插帧的原始帧率，
+        用来在"显示帧率没数据"时兜底。
         """
         picked = self._pick_target(now)
         if picked is None:
-            return None, "", None, None
+            return None, "", None, None, None
         pid, name, _reason = picked
         lane = self._presents.get(pid)
         if not lane:
-            return None, name, None, None
-        fps = self._rate(lane)
+            return None, name, None, None, None
+        fps, overall = self._rates(lane)
         if fps is None:
-            return None, name, None, pid
-        return fps, name, lane[-1][1], pid
+            return None, name, None, pid, overall
+        return fps, name, lane[-1][1], pid, overall
