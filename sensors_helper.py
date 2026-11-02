@@ -24,7 +24,7 @@ ORPHAN_GRACE_SECONDS = 10.0
 
 def default_paths() -> tuple[Path, Path]:
     """返回 (LibreHardwareMonitor.dll 所在目录, 输出 JSON 路径)。"""
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Pacelite"
+    base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Tickline"
     candidates: list[Path] = []
     # 单文件打包时资源在 _MEIPASS 里；目录版在 exe 旁边；源码运行在工程的 tools/ 下。
     bundle = getattr(sys, "_MEIPASS", None)
@@ -56,7 +56,14 @@ class _Reader:
     """把 LHM 的硬件树摊平成"我们要的几个数"。"""
 
     def __init__(self, dll_dir: Path) -> None:
-        import clr  # pythonnet
+        try:
+            import clr  # pythonnet
+        except ImportError as exc:
+            # 这是"没装 pythonnet"最常见的样子，给一句能直接照做的原因，
+            # 而不是让用户对着 "No module named 'clr'" 猜。
+            raise RuntimeError(
+                "缺少 pythonnet，无法加载 LibreHardwareMonitor：请执行 pip install pythonnet"
+            ) from exc
 
         clr.AddReference(str(dll_dir / "LibreHardwareMonitorLib.dll"))
         from LibreHardwareMonitor.Hardware import Computer, SensorType
@@ -72,18 +79,67 @@ class _Reader:
         self._computer.IsStorageEnabled = True
         self._computer.Open()
 
+    # CPU 温度的候选名字，按优先级排：AMD 的 Tctl 才是"CPU 温度"的正主，
+    # Intel 才是 Package；Tdie / Tccd 是各家主板和 HWiNFO 常见的叫法。
+    _CPU_TEMP_PRIORITY = ("Tctl", "Package", "Tdie", "Tccd", "Core Max")
+    # 单核温度：LHM 在 AMD 上叫 "Core #1"，Intel 上叫 "CPU Core #1"。
+    _CORE_TEMP_KEYS = ("CPU Core #", "Core #", "CCD")
+
+    def _walk(self, hardware, depth: int = 0):
+        """深度优先遍历硬件树，连子硬件（CPU 各核、主板 SuperIO）一起读。
+
+        LHM 把不少传感器挂在 SubHardware 下面，只看顶层 Hardware 会漏掉一半读数。
+        """
+        if depth > 3:
+            return
+        try:
+            hardware.Update()
+        except Exception:  # noqa: BLE001 - 单个硬件读失败不该拖垮整棵树
+            pass
+        yield hardware
+        for sub in hardware.SubHardware:
+            yield from self._walk(sub, depth + 1)
+
+    def _walk_many(self):
+        for hardware in self._computer.Hardware:
+            yield from self._walk(hardware)
+
+    def _pick_cpu_temp(self, temps: list[tuple[str, float]]) -> tuple[float | None, float | None]:
+        """从 CPU 温度列表里挑出 (CPU 温度, 单核最高温)。
+
+        AMD 只有 "Core (Tctl/Tdie)"，Intel 是 "CPU Package" + "Core Max"，
+        所以不能只认 "Package"——那样 AMD 机器上永远读不到温度。
+        0.0 一律当作"没读到"：非管理员读 SMU 时 LHM 会静默返回 0，画出来就是 0 ℃。
+        """
+        usable = [(name, value) for name, value in temps if value > 0.0]
+        chosen = None
+        for key in self._CPU_TEMP_PRIORITY:
+            for name, value in usable:
+                if key in name:
+                    chosen = value
+                    break
+            if chosen is not None:
+                break
+        core_values = [
+            value
+            for name, value in usable
+            if any(key in name for key in self._CORE_TEMP_KEYS)
+        ]
+        core_max = max(core_values) if core_values else None
+        if chosen is None and usable:
+            # 名字不认识的机器：只要有一个像样的 CPU 温度就用它，总比完全不显示好。
+            chosen = max(value for _, value in usable)
+        return chosen, core_max
+
     def read(self) -> dict:
-        cpu_package = None
-        cpu_core_max = None
+        cpu_temps: list[tuple[str, float]] = []
         cpu_power = None
-        gpu_power = None
-        cores: list[float] = []
         gpu_temp = None
+        gpu_power = None
         mem_temp = None
         fan = None
         disks: list[dict] = []
-        for hardware in self._computer.Hardware:
-            hardware.Update()
+        for hardware in self._walk_many():
             label = str(hardware.HardwareType)
             is_cpu = "Cpu" in label
             is_gpu = "Gpu" in label
@@ -97,18 +153,17 @@ class _Reader:
                 name = sensor.Name
                 value = float(sensor.Value)
                 if kind == self._sensor_type.Temperature:
-                    if "Package" in name and is_cpu and cpu_package is None:
-                        cpu_package = value
-                    elif "Core Max" in name:
-                        cpu_core_max = value
-                    elif is_cpu and (name.startswith("CPU Core #") or name.startswith("Core #")):
-                        cores.append(value)
+                    if is_cpu:
+                        cpu_temps.append((name, value))
                     elif is_gpu:
-                        gpu_temp = value
+                        # 一块卡有好几个温度点（Core / Hot Spot / Memory Junction），
+                        # 界面要的是核心温度。
+                        if gpu_temp is None or "GPU Core" in name:
+                            gpu_temp = value
                     elif is_memory and mem_temp is None:
                         # DDR5 内存条自带温度传感器（SPD Hub），DDR4 一般没有，
                         # 所以这里拿不到就是没有，界面自然不显示。
-                        mem_temp = value
+                        mem_temp = value if value > 0.0 else None
                     elif is_storage and disk is not None and disk["temp"] is None:
                         # 一块盘有多个温度点（Composite / #1 / #3 / 告警阈值），取第一个
                         # Composite 是最有代表性的整体温度。
@@ -117,9 +172,9 @@ class _Reader:
                 elif kind == self._sensor_type.Power:
                     # CPU 只取封装功耗（各核子项加起来会重复计数）；GPU 取第一个功耗项。
                     if is_cpu and "Package" in name and cpu_power is None:
-                        cpu_power = value
+                        cpu_power = value if value > 0.0 else None
                     elif is_gpu and gpu_power is None:
-                        gpu_power = value
+                        gpu_power = value if value > 0.0 else None
                 elif kind == self._sensor_type.Throughput and disk is not None:
                     # 读写速率（字节/秒）。LHM 用它自己维护的间隔算差值，
                     # 所以子进程第一次 Update 拿不到值，从第二轮开始才有。
@@ -133,17 +188,26 @@ class _Reader:
                 # LHM 在部分机器上拿不到硬盘型号（Name 是空白），留空由界面补 SSD1/SSD2。
                 disk["name"] = (hardware.Name or "").strip()
                 disks.append(disk)
-        return {
-            "cpu_temp": cpu_package if cpu_package is not None else cpu_core_max,
+        cpu_temp, cpu_core_max = self._pick_cpu_temp(cpu_temps)
+        payload = {
+            "cpu_temp": cpu_temp,
             "cpu_core_max": cpu_core_max,
             "cpu_power": cpu_power,
-            "cpu_cores": cores,
+            "cpu_cores": [],
             "gpu_temp": gpu_temp,
             "gpu_power": gpu_power,
             "mem_temp": mem_temp,
             "ssd": disks,
             "fan_rpm": fan,
+            # 调试用：把 CPU 温度传感器的原始名字和读数一起写出去。万一某台机器
+            # 又读不到温度，看这个就知道 LHM 到底给了什么名字、是不是非管理员读到 0。
+            "cpu_temps": {name: value for name, value in cpu_temps},
         }
+        if cpu_temp is None and cpu_temps:
+            payload["warn"] = "CPU 温度读数为空：" + ", ".join(
+                "%s=%.1f" % (name, value) for name, value in cpu_temps
+            )
+        return payload
 
     def close(self) -> None:
         try:

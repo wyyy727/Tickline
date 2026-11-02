@@ -12,6 +12,7 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -106,7 +107,7 @@ def install_pawnio(setup: Path) -> tuple[bool, str]:
 
 
 def _default_json() -> Path:
-    base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Pacelite"
+    base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Tickline"
     return base / "sensors.json"
 
 
@@ -131,10 +132,13 @@ def pawnio_setup_path() -> Path:
     return candidates[0]
 
 
+# pnputil 的字段名随系统语言变化（"发布名称"/"Published Name"/…），
+# 但 oem12.inf 这种文件名本身是语言无关的，直接按它找最稳。
+_INF_RE = re.compile(r"\boem\d+\.inf\b", re.IGNORECASE)
+
+
 def delete_pawnio_package() -> bool:
     """把驱动包从 DriverStore 里删掉（官方卸载器不一定做这一步）。"""
-    import subprocess
-
     try:
         listing = subprocess.run(
             ["pnputil", "/enum-drivers"],
@@ -147,15 +151,14 @@ def delete_pawnio_package() -> bool:
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return False
-    # 输出形如 "发布名称: oem12.inf" + 后面几行里的 "原始名称: pawnio.inf"
+    # 每条驱动是一个空行分隔的块，块里出现 "pawnio" 的就是驱动包；再从块里挑 oemN.inf。
     published = None
-    for block in listing.split("\n\n"):
-        if "pawnio" in block.lower():
-            for line in block.splitlines():
-                if "oem" in line.lower() and ".inf" in line.lower():
-                    published = line.split(":", 1)[-1].strip()
-                    break
-        if published:
+    for block in re.split(r"\r?\n\s*\r?\n", listing):
+        if "pawnio" not in block.lower():
+            continue
+        match = _INF_RE.search(block)
+        if match:
+            published = match.group(0)
             break
     if not published:
         return False
@@ -200,6 +203,8 @@ class SensorsClient:
         self.setup_path = pawnio_setup_path()
         self._started_at = 0.0
         self.last_error: str | None = None
+        # 子进程报"某项读不到"时的日志节流时间戳（见 snapshot()）
+        self._warn_logged_at = 0.0
 
     # ---- 读取 ------------------------------------------------------------
     def snapshot(self) -> dict | None:
@@ -213,6 +218,19 @@ class SensorsClient:
         stamp = float(payload.get("ts") or 0.0)
         if stamp and time.time() - stamp > FRESH_SECONDS:
             return None
+        # 子进程偶尔会带一句"某项读数空"的说明（例如 CPU 温度），
+        # 界面上只是不显示那个数字，原因得留在日志里，不然没法排障。
+        warn = payload.get("warn")
+        if isinstance(warn, str) and warn:
+            now = time.time()
+            if now - self._warn_logged_at > 60.0:
+                self._warn_logged_at = now
+                try:
+                    import pylog
+
+                    pylog.log(f"[sensors] {warn}")
+                except Exception:  # noqa: BLE001 - 日志失败不能影响读数
+                    pass
         return payload
 
     def _load(self) -> dict | None:
