@@ -1,9 +1,18 @@
-# Pacelite
+# Tickline
 
 单行「档位式」性能叠加层（Windows）。按参考图复刻：一条半透明黑条，左侧帧率，中间一条
 帧时间曲线，右侧按档位递增挂载 CPU / GPU / 温度 / 显存 / 内存。
 
 ## 运行
+
+先装 Python 依赖（`requirements.txt`）：
+
+```powershell
+pip install -r requirements.txt
+```
+
+`PySide6-Essentials` / `psutil` / `nvidia-ml-py` / `pythonnet` 四个都在里面；**`pythonnet` 只有
+精确传感器（CPU 温度）需要**，不装其它功能照常可用，只是设置里的那个开关永远起不来。
 
 ```powershell
 # 常驻运行（托盘 + 全局热键 + 设置窗口）
@@ -19,14 +28,19 @@ D:\develop\Python313\python.exe main.py --demo --fake-fps --no-tray --shot asset
 > 注意：`python` 在 WorkBuddy 的 shell 里指向自带的 3.13.12（没装 Qt），必须用
 > `D:\develop\Python313\python.exe`。
 >
-> 需要 CPU 温度（精确传感器）时，先跑一次 `python fetch_deps.py` 把 PawnIO 安装包下载到位。
+> 需要 CPU 温度（精确传感器）时，先跑一次 `python fetch_deps.py` 把 PawnIO 安装包下载到位，
+> 并确认 `pythonnet` 已安装（`python -c "import clr"` 不报错）。
+
+> **帧率需要管理员权限**：PresentMon 创建 ETW 会话必须有管理员权限，或当前账号属于
+> "Performance Log Users" 组。普通权限下其它指标照常，只有帧率那一栏显示 `—`，
+> 托盘会弹出提示告诉你原因。日常使用建议右键"以管理员身份运行"。
 
 ## 档位
 
 | # | 名称 | 显示内容 |
 |---|------|----------|
-| 1 | 简洁 FPS | 当前帧率（开帧生成时附带帧生成帧率） |
-| 2 | FPS 详情 | 帧生成帧率、实际帧率、最小/最大帧、帧时间曲线 |
+| 1 | 简洁 FPS | 一个帧率：开帧生成时给玩家看到的那个（标签是 `DLSS`/`FSR`/`FG`） |
+| 2 | FPS 详情 | 两个帧率分开写：帧生成标签后面是**显示帧率**，`原生` 后面是**应用帧率**；再加最小/最大帧与帧时间曲线 |
 | 3 | 加入 CPU/GPU | 再加处理器与显卡占用 |
 | 4 | 全面监控 | 再加 CPU 最忙单核/温度/功耗/频率、GPU 温度与功耗、显存、内存、SSD |
 
@@ -57,16 +71,34 @@ D:\develop\Python313\python.exe main.py --demo --fake-fps --no-tray --shot asset
 > 鼠标穿透和退出不设全局热键：它们都有更自然的入口（托盘菜单、✕、任务栏），
 > 多一个全局热键就多一份和别的软件抢键位的风险。
 
-**监视进程**下拉列出"正在出帧的进程 + 当前有可见窗口的进程"，也可以直接键入 exe 名。
-手动指定后只统计该进程：它没在出帧时帧率显示 `—`，不会偷偷回落到"最忙的那个"。
+**监视进程**下拉列出"正在出帧的进程 + 当前有可见窗口的进程"，只能从列表里选。
+
+留在「自动」时的选法（\`Tickline/presentmon.py\` 的 \`_pick_target\`）：
+
+1. 有**全屏窗口抢到前台**的进程 → 跟着它（进游戏、换游戏）；
+2. 否则**保持当前跟住的进程**：alt-tab 去看聊天窗口、桌面、设置窗口，长条不会跟着跳；
+3. 跟住的进程停帧了 → 退回"前台窗口的进程"，再退回"最忙的出帧进程"。
+
+为什么不能每格都按"最忙"重选：浏览器、壁纸引擎、Steam 界面、微信都能在后台一直出帧，
+条数轻松压过 43 帧的游戏，选中它们长条上就永远是一个不动的数。桌面合成器（dwm / csrss 等）
+永不参选；全屏判定每 3 秒枚举一次窗口（约 2 ms），前台窗口每格取一次（约 0.04 ms）。
+
+手动指定后只统计该进程：它没在出帧时帧率显示 `—`，不会偷偷回落到别的进程。
 
 ## 设置项
 
 显示器、档位、文字大小、背景透明度、颜色饱和度、布局（整行／按组换行）、
+帧时间曲线开关、刷新间隔（100–1000 ms）、
 显示内容（帧率／CPU／GPU／显存／内存／硬盘）、监视进程、快捷键（切换显示器）、
 只在游戏运行时显示、始终置顶、鼠标穿透、录制/截图里隐藏、在任务栏显示、开机自启（**默认关闭**）、
-精确传感器（CPU/GPU 温度，需管理员）。
-配置落在 `%APPDATA%\Pacelite\config.json`，所有改动即时生效并自动保存。
+精确传感器（CPU/GPU 温度，需管理员）、PawnIO 驱动的**安装／卸载**。
+
+驱动那一栏跟着系统实际状态变：没装时按钮是「安装 PawnIO 驱动」（下面附带一段"装了有什么用"
+的说明），装好了才变成「卸载 PawnIO 驱动」。所以第一次用的人不必先去勾精确传感器——
+想单独把驱动装好、回头再开温度也可以，两条路都能走通。
+
+配置落在 `%APPDATA%\Tickline\config.json`，所有改动即时生效并自动保存。
+`config.json` 里的值都会做类型校验：手改了类型（`null`、`"abc"`）也只会被纠正回默认值，不会让程序起不来。
 
 ### 多显示器
 
@@ -84,15 +116,15 @@ D:\develop\Python313\python.exe main.py --demo --fake-fps --no-tray --shot asset
 | CPU 总/各核占用、频率 | `psutil` |
 | CPU 温度（封装/各核） | 提权子进程 + LibreHardwareMonitor（MSR），需 PawnIO 驱动 |
 | 内存 | `psutil.virtual_memory` |
-| GPU 占用 | PDH `GPU Engine(*)\Utilization Percentage`（3D 引擎求和后截断） |
-| 显存占用 | PDH `GPU Adapter Memory(*)\Dedicated Usage`，核显回落到 `Shared Usage` |
-| 显存总量 | 注册表 `HardwareInformation.qwMemorySize`（PDH 无容量计数器） |
-| GPU 温度 | N 卡走 NVML（免提权）；其它显卡走 LibreHardwareMonitor |
+| GPU 占用 | PDH `GPU Engine(*)\Utilization Percentage`（同一适配器的 3D 引擎求和，跨适配器**取最大**） |
+| 显存占用 | PDH `GPU Adapter Memory(*)\Dedicated Usage`，核显回落到 `Shared Usage`（按 LUID 分适配器） |
+| 显存总量 | 注册表 `HardwareInformation.qwMemorySize`（PDH 无容量计数器），取各适配器里最大的容量 |
+| GPU 温度 | N 卡走 NVML（免提权，自动挑有显示输出的那张卡）；其它显卡走 LibreHardwareMonitor |
 | CPU / GPU 功耗 | LibreHardwareMonitor（CPU 取封装功耗）；N 卡也可由 NVML 提供 |
 | 内存温度 | LibreHardwareMonitor（只有 DDR5 内存条的 SPD Hub 带温度传感器，DDR4 一般没有） |
 | SSD 温度与读写速度 | LibreHardwareMonitor（默认不显示，设置里勾「硬盘」；`R`/`W` = 读/写速率，空闲时只留温度） |
-| 帧率 / 帧生成 | `tools\PresentMon\PresentMon.exe --output_stdout`，读 `MsBetweenPresents` 与 `MsBetweenDisplayChange` |
-| DLSS / FSR 判定 | 枚举目标进程已加载模块（`nvngx_dlssg` → DLSS，`ffx_fsr` → FSR），识别不出显示中性 `FG` |
+| 帧率 / 帧生成 | `tools\PresentMon\PresentMon.exe --output_stdout`，按表头找帧间隔列（v1 的 `MsBetweenPresents` 和 v2 的 `msBetweenPresents` 都认，大小写不敏感） |
+| DLSS / FSR 判定 | 枚举目标进程已加载模块（`nvngx_dlssg` → DLSS，`amdxcffx64` → FSR），识别不出显示中性 `FG` |
 | "游戏在跑"判定 | 存在铺满显示器的可见窗口（排除桌面/输入法等系统窗口），或有非合成器进程在持续出帧 |
 
 ### 温度为什么需要一个提权子进程
@@ -103,9 +135,11 @@ D:\develop\Python313\python.exe main.py --demo --fake-fps --no-tray --shot asset
 2. `tools\pawnio\PawnIO_setup.exe`（3.1 MB，官方签名）负责装 PawnIO 驱动，**同样内置**；
 3. 在设置里勾选「精确传感器」时**只弹一次 UAC**：提权拉起子进程，驱动由这个子进程静默安装
    （它已经是管理员，不需要第二次提权）；
-4. 子进程在提权环境里读传感器，把结果写进 `%LOCALAPPDATA%\Pacelite\sensors.json`，
+4. 子进程在提权环境里读传感器，把结果写进 `%LOCALAPPDATA%\Tickline\sensors.json`，
    主程序只读这个文件——**主程序始终保持普通权限**；
-5. 设置里提供「卸载 PawnIO 驱动」，随时可以撤掉（部分系统需重启才彻底移除）。
+5. 设置里给的是**同一个按钮的两种状态**：没装时是「安装 PawnIO 驱动」，装了才变「卸载 PawnIO
+   驱动」，随时可以撤掉（部分系统需重启才彻底移除）；安装走的是和上面同样的提权安装器，只是
+   不必先勾精确传感器。
 
 **使用者不需要自己下载任何东西**：驱动安装包和 LHM 库都随程序分发，勾一个开关即可。
 子进程会盯着父进程，主程序退出后 10 秒内自行结束，不留常驻的提权进程。
@@ -118,6 +152,41 @@ D:\develop\Python313\python.exe main.py --demo --fake-fps --no-tray --shot asset
 `MsBetweenDisplayChange` 的倒数是屏幕实际变帧的速率（含 DLSS/FSR 插帧）。两者比值即帧生成倍率，
 不需要任何 NVIDIA/AMD API，也不需要每帧的 FrameType。
 
+界面上这两个数是这样标的（2 档及以上）：
+
+```
+DLSS 126  原生 63   ↓125  ↑148   ~~~~曲线~~~~
+└帧生成标签 + 显示帧率        └原生 = 应用帧率
+```
+
+没开帧生成时只剩一个 `FPS`（就是应用帧率）。`↓`/`↑` 和曲线跟的是"界面上正在显示的那个数"，
+所以开了帧生成时它们描述的是显示帧率，不会出现曲线和数字对不上的情况。
+
+帧率不是按"最近 1 秒到了几行"算的：PresentMon 的 stdout 是块缓冲，几十帧会挤在一起到达，
+按到达时间开窗会让数字卡住甚至掉成 `—`。这里改成累加帧间隔本身（约 1 秒的帧数 / 这段时长），
+什么时候读到都不影响结果；某个进程超过 2.5 秒没有新帧就显示 `—`，而不是永远停在最后一个数字。
+
+## 关于名字：Pacelite → Tickline
+
+这个项目最初叫 **Pacelite**，现在统一用 **Tickline**。改名波及的不只是标题，代码里这些都跟着换了：
+
+| 换了什么 | 旧值 | 新值 |
+|---|---|---|
+| 配置文件 | `%APPDATA%\Pacelite\config.json` | `%APPDATA%\Tickline\config.json` |
+| 诊断日志 | `%LOCALAPPDATA%\Pacelite\pacelite.log` | `%LOCALAPPDATA%\Tickline\tickline.log` |
+| 传感器读数文件 | `%LOCALAPPDATA%\Pacelite\sensors.json` | `%LOCALAPPDATA%\Tickline\sensors.json` |
+| 单实例互斥体 | `Local\PaceliteOverlaySingleInstance` | `Local\TicklineOverlaySingleInstance` |
+| 开机自启注册表值 | `HKCU\...\Run\Pacelite` | `HKCU\...\Run\Tickline` |
+| PresentMon ETW 会话名 | `PaceliteMonitor` | `TicklineMonitor` |
+| 打包产物 | `dist\Pacelite.exe` | `dist\Tickline.exe` |
+
+**旧配置不用手动搬**：启动时发现新路径没有 config.json、而旧的还在，会复制一份过去
+（复制而不是移动，旧版本还能照常用自己的那份）。旧的自启项也会在启动时删掉，
+免得开机同时拉起两个版本。
+
+> 副作用（也算好处）：互斥体换名之后，一个还挂在后台的旧 Pacelite 进程不会再挡住
+> 新 Tickline 启动；反过来，两个版本可以同时在场，要彻底清场还是得结束旧进程。
+
 ## 打包
 
 ```powershell
@@ -126,11 +195,25 @@ D:\develop\Python313\python.exe build.py --onefile  # 单文件 exe，约 60-80 
 ```
 
 需要先 `pip install pyinstaller`（只有打包才要，日常运行不需要）。产物在 `dist\`，
-PresentMon、LHM 库、PawnIO 安装包都会一起打进去。
+PresentMon、LHM 库、PawnIO 安装包都会一起打进去；`pythonnet` 的 `Python.Runtime.dll`
+由 `--collect-all pythonnet` 一并收集（漏了它，打包版一勾精确传感器就会报
+"Could not load Python.Runtime"）。
+
+打包后的自启项只写 exe 自身的路径，不再拼一次入口脚本 —— 以前的写法在 `--windowed`
+单文件版上会变成 `"Tickline.exe" "Tickline.exe"`，开机启动直接报参数错误退出。
 
 ## 依赖下载
 
-构建和运行需要三个第三方组件，都在 `tools\` 下。缺了不用手动找，`build.py` 会自动调用下载：
+### Python 包
+
+```powershell
+pip install -r requirements.txt            # 运行时依赖
+python fetch_deps.py --install-python      # 同上，顺便检查/补齐缺失项
+```
+
+### 第三方组件
+
+构建和运行还需要三个第三方组件，都在 `tools\` 下。缺了不用手动找，`build.py` 会自动调用下载：
 
 ```powershell
 python fetch_deps.py              # 缺什么下什么
@@ -168,14 +251,25 @@ LHM 在本机（i5-1135G7 笔记本）实际暴露的传感器，按硬件分组
 
 ## 已知限制
 
+- **帧率需要管理员权限**：PresentMon 创建 ETW 会话要管理员权限或 "Performance Log Users"
+  组。普通权限下它以 `access denied` 退出，本程序会捕获 stderr 并在托盘提示，其它指标照常。
 - **PresentMon 的 stdout 是块缓冲**：游戏帧率正常时数据以约 4 KB 为块到达；空闲桌面（无
   DXGI 提交）时不会有任何行 —— 叠加层显示 `—` 表示"没有目标在出帧"，不是采集失败。
+- **显存总量取各适配器里的最大值**：注册表的容量和 GPU 引擎的 LUID 对不上号，无法精确
+  配对。装了虚拟显示器（向日葵/Moonlight/Parsec 会声明假显存）或核显+独显双卡时，
+  分母以最大那张卡为准。
+- **帧时间曲线与 ↓/↑ 只覆盖最近 30 秒左右**（120 个采样点，默认 250 ms 一格）：改刷新间隔会同时改变
+  这段窗口的长度（100 ms ≈ 12 秒，1000 ms ≈ 2 分钟）。
 - **ETW 会话残留**：PresentMon 被强杀会留下同名 realtime session，之后的采集会失败。正常退出
   时本程序会执行 `--terminate_existing_session` 清理；若手工杀过进程，用 `logman query -ets`
   查看、`logman stop <名字> -ets` 清理。
 - 核显上 `Dedicated Usage` 恒为 0，显存只能显示占用量，没有可比的分母。
 - 全屏独占游戏不显示（与所有分层窗口叠加层一致），需无边框窗口化。
 - "只在游戏运行时显示"是启发式判断：无边框全屏的浏览器/视频播放器也会被判为"游戏"。
+- **DLSS/FSR 标签只认帧生成模块**：`nvngx_dlssg` / `amdxcffx64`。只开 DLSS 超分
+  （`nvngx_dlss.dll`）而没有帧生成时会显示中性的 `FG` —— 那是准确的状态，不是识别失败。
+- **诊断日志**：`%LOCALAPPDATA%\Tickline\tickline.log`（超过 1 MB 自动轮转成 `tickline.1.log`）。
+  界面版没有控制台，出错原因（PresentMon 权限、传感器启动失败等）都写在这里，也会弹托盘提示。
 
 ## 目录
 
@@ -196,7 +290,9 @@ winutil.py         录制隐藏、全局热键
 single_instance.py 单实例互斥体
 sysintegrate.py    开机自启
 build.py           PyInstaller 打包
-fetch_deps.py      下载 PresentMon / LHM / PawnIO（构建前自动调用）
+fetch_deps.py      下载 PresentMon / LHM / PawnIO（构建前自动调用），检查 pip 依赖
+pylog.py           诊断日志（%LOCALAPPDATA%\Tickline\tickline.log）
+requirements.txt   运行时 pip 依赖
 dev/               验证脚本（presenter 合成帧源、probe 分步探针、settings_shot、layout_shot）
 assets/            截图
 ```
