@@ -8,15 +8,17 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QGuiApplication, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
+import pylog
 from config import Config
 from metrics import Sampler
-from presentmon import PresentMonFeed
+from presentmon import FrameStats, PresentMonFeed
 from theme import Theme
 from tiers import Segment, build_rows, build_segments
 
@@ -71,6 +73,8 @@ class StripWindow(QWidget):
         self._drag_offset = QPoint(0, 0)
 
         self._apply_flags()
+        # 任务栏/悬停提示里显示的是窗口标题；不设的话会沿用解释器名字，变成一个"python"。
+        self.setWindowTitle("Tickline")
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
 
@@ -82,8 +86,12 @@ class StripWindow(QWidget):
         self._unit_font.setPixelSize(max(8, int(round(cfg.font_size * 0.74))))
 
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._refresh)
+        self._timer.timeout.connect(self._tick)
         self._timer.start(cfg.refresh_ms)
+        self._series: list[float] = []
+        self._positioned = False
+        # 渲染故障的节流时间戳（每种故障各自 10 秒一次日志）。
+        self._last_fault: dict[str, float] = {}
 
     # ---- 对外接口 --------------------------------------------------------
     def _apply_flags(self) -> None:
@@ -97,8 +105,10 @@ class StripWindow(QWidget):
             flags |= Qt.WindowStaysOnTopHint
         if self.cfg.click_through:
             flags |= Qt.WindowTransparentForInput
-        self.setWindowFlags(flags)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, self.cfg.click_through)
+        # setWindowFlags 会重建原生窗口（隐藏再显示），设置里每拖一格都调就是一片闪烁。
+        if self.windowFlags() != flags:
+            self.setWindowFlags(flags)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, bool(self.cfg.click_through))
 
     def apply_config(self) -> None:
         """设置改动后重建窗口标志并立即重绘（穿透、置顶、任务栏、字号都可能变）。"""
@@ -106,8 +116,11 @@ class StripWindow(QWidget):
         self._apply_flags()
         self._mono.setPixelSize(self.cfg.font_size)
         self._unit_font.setPixelSize(max(8, int(round(self.cfg.font_size * 0.74))))
+        # 刷新间隔也可能在设置里改了，定时器要跟着换档。
+        self._timer.start(self.cfg.refresh_ms)
         if was_visible:
             self.show()
+        self._keep_visible()
         self._refresh()
 
     def set_tier(self, tier: int) -> None:
@@ -123,9 +136,41 @@ class StripWindow(QWidget):
             self.hide()
 
     # ---- 数据 ------------------------------------------------------------
+    def _tick(self) -> None:
+        """定时器每格：先推进一次采样，再重绘。
+
+        推进（sample）和读取（stats）分开，重绘、判定"有没有游戏在跑"都只读，
+        不会再把曲线历史灌成两倍密度。
+
+        两边都兜异常：数据层任何一处抛错，以前会直接把 GUI 线程的槽炸掉 —— 窗口
+        停在 show() 时的默认尺寸（640x480、全透明），任务栏有条目但屏幕上看不见。
+        """
+        try:
+            self.feed.sample()
+        except Exception as exc:  # noqa: BLE001 - 界面不能因为数据层异常停摆
+            self._fault("sample", exc)
+        try:
+            self._refresh()
+        except Exception as exc:  # noqa: BLE001
+            self._fault("refresh", exc)
+
+    def _fault(self, where: str, exc: Exception) -> None:
+        """记录一次渲染故障，同一种故障 10 秒内只落一次盘，避免刷爆日志。"""
+        stamp = time.monotonic()
+        previous = self._last_fault.get(where)
+        if previous is not None and stamp - previous < 10.0:
+            return
+        self._last_fault[where] = stamp
+        pylog.log(f"[overlay] {where} 失败: {type(exc).__name__}: {exc}")
+
     def _refresh(self) -> None:
         snap = self.sampler.latest()
-        fps = self.feed.stats()
+        try:
+            fps = self.feed.stats()
+        except Exception as exc:  # noqa: BLE001 - 读数失败不该让整块界面停摆
+            self._fault("stats", exc)
+            fps = FrameStats()
+        self._series = list(fps.series)
         if self.demo:
             # demo 每档一行，方便并排比对；不套用换行布局。
             self._segments = [
@@ -145,7 +190,15 @@ class StripWindow(QWidget):
         self.update()
 
     def _ensure_placed(self) -> None:
-        """定位策略：保存的坐标还落在某块屏幕上就用它，否则落到指定屏幕的左上角。"""
+        """首次定位：保存的坐标还落在某块屏幕上就用它，否则落到指定屏幕的左上角。
+
+        之后只在"整块窗口已经落到所有屏幕之外"时才搬回来：以前每次内容宽度变化都按
+        配置坐标重新 move()，手动拖过位置的人会看到长条被拽回原处。
+        """
+        if self._positioned:
+            self._keep_visible()
+            return
+        self._positioned = True
         if (
             self.cfg.x >= 0
             and self.cfg.y >= 0
@@ -153,6 +206,14 @@ class StripWindow(QWidget):
         ):
             self.move(self.cfg.x, self.cfg.y)
             return
+        self._place_on(self._screen_by_name(self.cfg.monitor))
+
+    def _keep_visible(self) -> None:
+        """窗口整体已经不在任何屏幕里（拔掉外接屏、改了分辨率）就搬回目标屏。"""
+        rect = self.frameGeometry()
+        for screen in QGuiApplication.screens():
+            if screen.geometry().intersects(rect):
+                return
         self._place_on(self._screen_by_name(self.cfg.monitor))
 
     @staticmethod
@@ -187,6 +248,7 @@ class StripWindow(QWidget):
         if screen is not None:
             self.cfg.monitor = screen.name() or ""
         self._place_on(screen)
+        self._positioned = True
         if self.on_moved is not None:
             self.on_moved(self.cfg.x, self.cfg.y)
         self.update()
@@ -233,11 +295,23 @@ class StripWindow(QWidget):
         total += SEG_GAP * (len(segments) - 1)
         return PAD_X * 2 + total + close
 
+    NO_DATA_TEXT = "Tickline · 等待数据"
+
+    def _placeholder_width(self) -> float:
+        """一条数据都没有时的占位条宽度。
+
+        以前 segments 全空时 _measure 会给出固定 240 的宽度，paintEvent 又什么都不画，
+        结果窗口是一块全透明的默认矩形 —— 任务栏有条目、屏幕上却什么都没有。
+        """
+        value_font = QFontMetricsF(self._mono)
+        close = CLOSE_W if self._close_enabled() else 0.0
+        return PAD_X * 2 + value_font.horizontalAdvance(self.NO_DATA_TEXT) + close
+
     def _measure(self):
         from PySide6.QtCore import QSize
 
         widths = [self._row_width(row) for row in self._segments if row]
-        width = int(max(widths)) if widths else 240
+        width = int(max(widths)) if widths else int(self._placeholder_width())
         rows = sum(1 for row in self._segments if row) or 1
         height = int(self._band_height() * rows + BAND_GAP * (rows - 1))
         return QSize(max(120, width), max(int(self._band_height()), height))
@@ -261,19 +335,34 @@ class StripWindow(QWidget):
             band = QRectF(0.0, top, width, band_h)
             painter.fillRect(band, theme.background)
             self._paint_row(painter, band, row, theme)
+        if visible == 0:
+            # 数据一条都没到（PresentMon 起不来、采样异常等）：画一条「等待数据」的占位条，
+            # 让用户至少知道程序活着，而不是对着一块看不见的透明矩形猜。
+            width = min(float(self.width()), self._placeholder_width())
+            band = QRectF(0.0, 0.0, width, band_h)
+            painter.fillRect(band, theme.background)
+            painter.setFont(self._mono)
+            painter.setPen(theme.unit)
+            value_font = QFontMetricsF(self._mono)
+            baseline = band.top() + (band.height() + value_font.capHeight()) / 2.0
+            painter.drawText(QPointF(band.left() + PAD_X, baseline), self.NO_DATA_TEXT)
         if self._hover and self._close_enabled():
             self._paint_close(painter, theme)
         painter.end()
 
-    def _close_rect(self) -> QRectF:
-        """✕ 的点击区域：固定 12 px，垂直居中，不随字号变大。
+    def _band_width(self) -> float:
+        """第一行实际铺到的宽度：column 布局下比整窗窄，✕ 要贴着这一行的右端。"""
+        for row in self._segments:
+            if row:
+                return min(float(self.width()), self._row_width(row))
+        return min(float(self.width()), self._placeholder_width())
 
-        之前按条带高度算，字号调大后 ✕ 会被拉成一个大叉，看着很难看。
-        """
+    def _close_rect(self) -> QRectF:
+        """✕ 的点击区域：固定 12 px，垂直居中，不随字号变大，贴着第一行色块的右端。"""
         size = CLOSE_SIZE
         band_h = self._band_height()
         return QRectF(
-            self.width() - CLOSE_W / 2.0 - size / 2.0,
+            self._band_width() - CLOSE_W / 2.0 - size / 2.0,
             (band_h - size) / 2.0,
             size,
             size,
@@ -335,7 +424,7 @@ class StripWindow(QWidget):
 
     def _paint_spark(self, painter: QPainter, box: QRectF, seg: Segment, theme: Theme) -> None:
         """帧率曲线；低于窗口均值 70% 的点标红，对应参考图里的掉帧红点。"""
-        series = self.feed.stats().series
+        series = self._series
         if len(series) < 2:
             # 没有数据时画一条淡横线，提示"曲线在这里，只是还没数据"
             pen = QPen(QColor(theme.separator))

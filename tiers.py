@@ -91,11 +91,14 @@ def build_segments(
     # 1 档只给一个数字：开帧生成时给玩家看到的那个帧率，且只带一个标签。
     if sections.fps:
         if fps.generating:
+            # 两个数要一眼分得开：帧生成后的显示帧率，和游戏真正的原生帧率。
             segments.append(
                 Segment(fps.fg_label, _fps(fps.displayed_fps), color="fg", group="fps")
             )
             if tier >= 2:
-                segments.append(Segment("FPS", _fps(fps.presented_fps), color="fps", group="fps"))
+                segments.append(
+                    Segment("原生", _fps(fps.presented_fps), color="fps", group="fps")
+                )
         else:
             segments.append(Segment("FPS", _fps(fps.presented_fps), color="fps", group="fps"))
         if tier >= 2:
