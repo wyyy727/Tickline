@@ -123,7 +123,7 @@ D:\develop\Python313\python.exe main.py --demo --fake-fps --no-tray --shot asset
 | CPU / GPU 功耗 | LibreHardwareMonitor（CPU 取封装功耗）；N 卡也可由 NVML 提供 |
 | 内存温度 | LibreHardwareMonitor（只有 DDR5 内存条的 SPD Hub 带温度传感器，DDR4 一般没有） |
 | SSD 温度与读写速度 | LibreHardwareMonitor（默认不显示，设置里勾「硬盘」；`R`/`W` = 读/写速率，空闲时只留温度） |
-| 帧率 / 帧生成 | `tools\PresentMon\PresentMon.exe --output_stdout`，按表头找帧间隔列（v1 的 `MsBetweenPresents` 和 v2 的 `msBetweenPresents` 都认，大小写不敏感） |
+| 帧率 / 帧生成 | `tools\PresentMon\PresentMon.exe --output_stdout --v2_metrics --track_frame_type`，按表头找帧间隔列（v1 的 `MsBetweenPresents`/`MsBetweenDisplayChange` 和 v2 的 `FrameTime`/`DisplayedTime` 两套列名都认，大小写不敏感） |
 | DLSS / FSR 判定 | 枚举目标进程已加载模块（`nvngx_dlssg` → DLSS，`amdxcffx64` → FSR），识别不出显示中性 `FG` |
 | "游戏在跑"判定 | 存在铺满显示器的可见窗口（排除桌面/输入法等系统窗口），或有非合成器进程在持续出帧 |
 
@@ -148,9 +148,27 @@ D:\develop\Python313\python.exe main.py --demo --fake-fps --no-tray --shot asset
 > 为什么不用 WinRing0：它被大量杀软标记，而 PawnIO 是签名驱动、在开启"内存完整性"（HVCI）的
 > 系统上也能正常加载。
 
-两个帧率的含义：`MsBetweenPresents` 的倒数是应用真正 `Present()` 出帧的速率（游戏实际帧率），
-`MsBetweenDisplayChange` 的倒数是屏幕实际变帧的速率（含 DLSS/FSR 插帧）。两者比值即帧生成倍率，
-不需要任何 NVIDIA/AMD API，也不需要每帧的 FrameType。
+两个帧率的含义（实测 Phantom Blade Zero + DLSS 帧生成，5 秒原始数据）：
+
+- **原生帧率** = 应用自己 `Present()` 出帧的速率，也就是游戏没开插帧时的真实帧率；
+- **显示帧率** = 屏幕实际变帧的速率（`DisplayedTime`/`MsBetweenDisplayChange` 的倒数），含插帧。
+
+关键事实：**插出来的帧也会各占一次 present**，所以直接数 present 会把原生帧率算成显示帧率。
+表现在原始数据里是"present 间隔一大一小交替"：
+
+```
+present 间隔(ms)  0.59  21.98  0.67  21.18  0.44  21.97   <-- 小的是插帧，大的才是真帧
+变帧间隔(ms)     11.56  10.76  11.52  11.21  11.56  10.19   <-- 屏幕一直在按 ~87 帧刷新
+```
+
+程序据此剔掉插帧：
+
+1. 优先看 `FrameType`（v2 指标才有）：非 `application` 的帧算插帧；
+2. 没有这一列（v1 指标，或驱动没有上报类型）就看间隔：明显小于平均间隔的
+   （阈值 `max(1.5 ms, 平均 × 0.4)`）算插帧，剩下的才是应用帧。
+
+上面这份数据两种方式算出来都是 **原生 44 / 显示 87（倍率 2.0）**，界面上就是
+`DLSS 87  原生 44`。倍率超过 1.25 才判定为"开了帧生成"，所以不开插帧时仍然只有一个 `FPS`。
 
 界面上这两个数是这样标的（2 档及以上）：
 
