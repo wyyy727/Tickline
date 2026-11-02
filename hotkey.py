@@ -119,7 +119,9 @@ def parse(spec: str) -> tuple[int, int] | None:
     if modifiers == 0 or not key_part:
         return None
 
-    if len(key_part) == 1 and key_part.isalnum():
+    # 只认 ASCII 字母/数字：`isalnum()` 对中文、全角字符也为真，
+    # 那样 "Ctrl+中" 会被 ord() 成上万的无意义虚拟键码，注册必然失败还查不出原因。
+    if len(key_part) == 1 and key_part.isascii() and key_part.isalnum():
         return modifiers, ord(key_part.upper())
     if key_part.startswith("f") and key_part[1:].isdigit():
         index = int(key_part[1:])
