@@ -16,6 +16,7 @@ import http.client
 import os
 import shutil
 import ssl
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -48,16 +49,57 @@ PAWNIO_DEST = TOOLS / "pawnio" / "PawnIO_setup.exe"
 # 只解这些：LHM 的 exe、绘图库 OxyPlot、WinForms 控件、语言资源包都用不上。
 LHM_SKIP_PREFIX = ("OxyPlot", "Aga.Controls", "LibreHardwareMonitor.exe")
 
-USER_AGENT = "Pacelite-FetchDeps/1.0"
+USER_AGENT = "Tickline-FetchDeps/1.0"
+
+# 运行时需要的 pip 包（模块名, 发行版名）。缺了不会崩，但对应功能会静默消失：
+# 没 PySide6 起不来，没 psutil 采不了硬件，没 pynvml 没有 N 卡温度，没 pythonnet 没精确传感器。
+REQUIRED_PYTHON = (
+    ("PySide6", "PySide6-Essentials"),
+    ("psutil", "psutil"),
+    ("pynvml", "nvidia-ml-py"),
+    ("clr", "pythonnet"),
+)
+
+
+def missing_python_packages() -> list[str]:
+    """返回缺失的 pip 发行版名（可直接喂给 pip install）。"""
+    import importlib.util
+
+    missing: list[str] = []
+    for module, package in REQUIRED_PYTHON:
+        try:
+            found = importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(package)
+    return missing
+
+
+def ensure_python_packages(install: bool = False) -> bool:
+    """检查（可选：安装）运行时的 pip 包；返回是否齐全。"""
+    missing = missing_python_packages()
+    if not missing:
+        return True
+    print(f"[提示] 缺少 Python 依赖：{', '.join(missing)}")
+    if not install:
+        print("       安装：pip install -r requirements.txt")
+        print("       （或加 --install-python 让本脚本代劳）")
+        return False
+    print(f"[安装] {sys.executable} -m pip install " + " ".join(missing))
+    result = subprocess.run([sys.executable, "-m", "pip", "install", *missing])
+    return result.returncode == 0 and not missing_python_packages()
 
 
 def _ssl_context() -> ssl.SSLContext:
-    """默认严格校验证书；只有显式设置 PACELITE_INSECURE_TLS=1 时才跳过。
+    """默认严格校验证书；只有显式设置 TICKLINE_INSECURE_TLS=1 时才跳过。
 
     留这个开关是为了在证书链异常的开发环境里能跑通，正常使用绝不该打开。
+    旧名 PACELITE_INSECURE_TLS 仍然认，免得已经把变量写进脚本/环境的人突然失效。
     """
-    if os.environ.get("PACELITE_INSECURE_TLS") == "1":
-        return ssl._create_unverified_context()
+    for name in ("TICKLINE_INSECURE_TLS", "PACELITE_INSECURE_TLS"):
+        if os.environ.get(name) == "1":
+            return ssl._create_unverified_context()
     return ssl.create_default_context()
 
 
@@ -153,6 +195,8 @@ def fetch_pawnio(force: bool = False) -> bool:
 
 def ensure_dependencies(force: bool = False, with_pawnio: bool = True) -> bool:
     """补齐所有依赖；返回是否有文件被下载（供 build.py 打日志）。"""
+    # pip 包下载**下载不下来**，这里只做检查和提示，绝不自动安装（用户可能用的是别的解释器）。
+    ensure_python_packages(install=False)
     changed = False
     changed |= fetch_presentmon(force)
     changed |= fetch_lhm(force)
@@ -162,10 +206,14 @@ def ensure_dependencies(force: bool = False, with_pawnio: bool = True) -> bool:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="下载 Pacelite 构建所需的第三方组件")
+    parser = argparse.ArgumentParser(description="下载 Tickline 构建所需的第三方组件")
     parser.add_argument("--force", action="store_true", help="忽略已有文件，全部重新下载")
     parser.add_argument("--no-pawnio", action="store_true", help="跳过 PawnIO（不需要 CPU 温度时）")
+    parser.add_argument(
+        "--install-python", action="store_true", help="顺便用 pip 安装 requirements.txt 里的包"
+    )
     args = parser.parse_args(argv)
+    ensure_python_packages(install=args.install_python)
     try:
         ensure_dependencies(force=args.force, with_pawnio=not args.no_pawnio)
     except (RuntimeError, urllib.error.URLError, zipfile.BadZipFile) as exc:

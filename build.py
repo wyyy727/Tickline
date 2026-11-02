@@ -4,11 +4,11 @@ r"""打包脚本：用 PyInstaller 生成可分发的程序。
 
   目录版（默认，推荐）
     python build.py
-    产物：dist/Pacelite/Pacelite.exe + 依赖目录，启动快（约 0.5 秒），可以只更新单个文件。
+    产物：dist/Tickline/Tickline.exe + 依赖目录，启动快（约 0.5 秒），可以只更新单个文件。
 
   单文件版（体积大、启动慢，但确实只有一个 exe）
     python build.py --onefile
-    产物：dist/Pacelite.exe，约 60-80 MB，首次启动要解压到临时目录（2-4 秒）。
+    产物：dist/Tickline.exe，约 60-80 MB，首次启动要解压到临时目录（2-4 秒）。
 
 两种形态都会把 PresentMon.exe 一起带上，程序启动时会先找同目录下的 tools\PresentMon。
 """
@@ -29,7 +29,7 @@ PAWNIO_SETUP = TOOLS / "pawnio" / "PawnIO_setup.exe"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="打包 Pacelite")
+    parser = argparse.ArgumentParser(description="打包 Tickline")
     parser.add_argument("--onefile", action="store_true", help="生成单文件 exe（启动更慢）")
     parser.add_argument("--console", action="store_true", help="保留控制台窗口（排错用）")
     parser.add_argument("--no-fetch", action="store_true", help="缺依赖时不自动下载")
@@ -70,7 +70,7 @@ def main() -> int:
         "--noconfirm",
         "--clean",
         "--name",
-        "Pacelite",
+        "Tickline",
         "--onefile" if args.onefile else "--onedir",
         "--console" if args.console else "--windowed",
         # Qt 里用不到的模块先剔掉，产物能小一大截
@@ -84,6 +84,13 @@ def main() -> int:
         "PySide6.Qt3DCore",
         "--exclude-module",
         "tkinter",
+        # pythonnet：LHM 是 .NET 库，缺了 clr 精确传感器永远不可用。
+        # 只写 --hidden-import clr 不够，Python.Runtime.dll 等运行时文件不会被带上，
+        # 打出来的包在别人机器上会报 "Could not load Python.Runtime"。
+        "--collect-all",
+        "pythonnet",
+        "--hidden-import",
+        "clr",
         # PresentMon 跟着程序走，运行期按同级目录查找
         "--add-binary",
         f"{PRESENTMON};tools/PresentMon",
@@ -99,7 +106,7 @@ def main() -> int:
     if result.returncode != 0:
         return result.returncode
 
-    target = ROOT / "dist" / ("Pacelite.exe" if args.onefile else "Pacelite")
+    target = ROOT / "dist" / ("Tickline.exe" if args.onefile else "Tickline")
     if target.exists():
         if args.onefile:
             shutil.copy2(ROOT / "README.md", ROOT / "dist" / "README.md")

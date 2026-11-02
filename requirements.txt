@@ -1,0 +1,19 @@
+# Tickline 运行时依赖（源码运行：pip install -r requirements.txt）
+#
+# Python 3.9+（源码用了 `X | None` 注解，靠 from __future__ import annotations 兼容到 3.9）。
+#
+# PySide6 完整包约 200 MB；这里只要 Essentials（QtWidgets/QtGui/QtCore 都在里面）。
+PySide6-Essentials>=6.5,<7
+
+# CPU / 内存 / 频率 / 进程
+psutil>=5.9
+
+# NVIDIA 温度与功耗（NVML）。非 N 卡机器装了也无害，代码会自动退回 LibreHardwareMonitor。
+nvidia-ml-py>=12
+
+# 精确传感器（CPU 温度、内存温度）：LibreHardwareMonitor 是 .NET 库，必须靠 pythonnet 加载。
+# 不装不影响其它功能，只是设置里的「精确传感器」永远无法启用。
+pythonnet>=3.0
+
+# 只有打包才需要，源码运行不用装：
+# pyinstaller>=6.0
