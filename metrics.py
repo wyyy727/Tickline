@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import re
 import threading
 import time
 from dataclasses import dataclass, field
 
 import psutil
+
+import pylog
 
 _pdh = ctypes.WinDLL("pdh", use_last_error=True)
 
@@ -124,24 +127,26 @@ class PdhCounterArray:
         self.ok = False
 
 
-def _vram_total_from_registry() -> int | None:
-    """从显示适配器的注册表块里读显存总量。
+def _vram_caps_from_registry() -> list[int]:
+    """从显示适配器的注册表块里读各卡显存容量（升序）。
 
     PDH 只暴露显存**用量**，没有容量计数器；而 `Win32_VideoController.AdapterRAM` 是 32 位值，
     4 GB 以上的卡会溢出。显卡类键下的 `qwMemorySize` 是 64 位，多数监控工具都读它。
+    注册表只按 0000/0001 编号，拿不到 LUID，所以这里返回全部容量，由调用方按用量挑分母
+    ——以前直接取"所有适配器里最大的那个"，等于假设只用独显，核显/虚拟显示器一掺和就错。
     """
     try:
         import winreg
     except ImportError:  # pragma: no cover - 非 Windows 平台
-        return None
+        return []
     key_path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
-    best = None
+    caps: list[int] = []
     try:
         root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path)
     except OSError:
-        return None
+        return caps
     with root:
-        # 适配器挂在 0000、0001… 子键下，取所有适配器里最大的那个容量。
+        # 适配器挂在 0000、0001… 子键下，每个子键记一张卡。
         for index in range(8):
             try:
                 sub = winreg.OpenKey(root, f"{index:04d}")
@@ -156,13 +161,39 @@ def _vram_total_from_registry() -> int | None:
                         raw, _kind = winreg.QueryValueEx(sub, name)
                     except OSError:
                         continue
+                    value = 0
                     if isinstance(raw, bytes) and len(raw) >= size:
                         value = int.from_bytes(raw[:size], "little")
-                        if value > 0 and (best is None or value > best):
-                            best = value
-                    elif isinstance(raw, int) and raw > 0:
-                        best = max(best or 0, raw)
-    return best
+                    elif isinstance(raw, int):
+                        value = raw
+                    if value > 0 and value not in caps:
+                        caps.append(value)
+    caps.sort()
+    return caps
+
+
+_LUID_RE = re.compile(r"luid_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)", re.IGNORECASE)
+
+
+def _luid_of(instance: str) -> tuple[int, int] | None:
+    """从 PDH 实例名里取出适配器 LUID（形如 pid_1_luid_0x0_0x13061_phys_0_eng_0_engtype_3D）。"""
+    match = _LUID_RE.search(instance or "")
+    if not match:
+        return None
+    return int(match.group(1), 16), int(match.group(2), 16)
+
+
+def _per_adapter_sum(items, want: str = "") -> dict[tuple[int, int], float]:
+    """把计数器实例按适配器分组求和；want 非空时只统计实例名里含它的引擎。"""
+    totals: dict[tuple[int, int], float] = {}
+    for name, value in items:
+        if want and want not in name:
+            continue
+        luid = _luid_of(name)
+        if luid is None:
+            continue
+        totals[luid] = totals.get(luid, 0.0) + value
+    return totals
 
 
 @dataclass
@@ -208,10 +239,30 @@ class _Nvml:
 
             pynvml.nvmlInit()
             self._nvml = pynvml
-            self._handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            self.ok = True
+            # 不能固定用 index 0：多 N 卡（或插着 eGPU）时 0 号未必是显示器接着的那张，
+            # 读出来会是另一张卡的温度/功耗。优先有显示输出的，再按显存取大的。
+            self._handle = self._pick_device()
+            self.ok = self._handle is not None
         except Exception:  # noqa: BLE001 - 没有厂商 SDK 是常态，绝不能因此崩溃
             self.ok = False
+
+    def _pick_device(self):
+        candidates = []
+        for index in range(int(self._nvml.nvmlDeviceGetCount())):
+            handle = self._nvml.nvmlDeviceGetHandleByIndex(index)
+            try:
+                display = bool(self._nvml.nvmlDeviceGetDisplayActive(handle))
+            except Exception:  # noqa: BLE001 - 老驱动可能没有这个接口
+                display = False
+            try:
+                memory = int(self._nvml.nvmlDeviceGetMemoryInfo(handle).total)
+            except Exception:  # noqa: BLE001
+                memory = 0
+            candidates.append((display, memory, handle))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[-1][2]
 
     def temperature(self) -> float | None:
         if not self.ok:
@@ -247,12 +298,13 @@ class Sampler:
         self._core_peak = 0.0
         self._nvml = _Nvml()
         self._precise = precise
+        self._failures = 0
         self._gpu = PdhCounterArray(r"\GPU Engine(*)\Utilization Percentage")
         # 显存先看独占（真独显），再退回共享（核显）。核显的工作集全在系统内存里，
         # Dedicated Usage 恒为 0，只用它会导致显存永远是 0。
         self._vram_dedicated = PdhCounterArray(r"\GPU Adapter Memory(*)\Dedicated Usage")
         self._vram_shared = PdhCounterArray(r"\GPU Adapter Memory(*)\Shared Usage")
-        self._vram_total = _vram_total_from_registry()
+        self._vram_caps = _vram_caps_from_registry()
         self._freq_max = None
         freq = psutil.cpu_freq()
         if freq and freq.max:
@@ -262,7 +314,7 @@ class Sampler:
         # psutil 的 cpu_percent 首次调用只建立基线（返回 0），先空跑两次避免第一帧是 0%。
         psutil.cpu_percent(interval=None)
         psutil.cpu_percent(interval=None, percpu=True)
-        self._thread = threading.Thread(target=self._run, name="pacelite-sampler", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="tickline-sampler", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -272,6 +324,23 @@ class Sampler:
         self._gpu.close()
         self._vram_dedicated.close()
         self._vram_shared.close()
+
+    def _capacity_for(self, used: int) -> int | None:
+        """给"已用"挑一个可信的分母：取所有适配器里最大的容量。
+
+        注册表按 0000/0001 存各卡容量，和 PDH 的 LUID 对不上号，没法精确配对，
+        所以只能取最大值。曾经试过"挑能容下 used 的最小容量"，结果在装了虚拟显示器
+        （向日葵 / Moonlight / Parsec，会声明一个 4 GB 的假显存）的机器上，
+        真实独显的用量落进了虚拟卡那一档，界面显示成 "3.9/4.0 GB"。
+        """
+        caps = self._vram_caps
+        if not caps or used > caps[-1]:
+            return None
+        return caps[-1]
+
+    def set_interval(self, refresh_ms: int) -> None:
+        """界面改了刷新间隔：采样线程下一轮就按新节奏走。"""
+        self._interval = max(0.1, refresh_ms / 1000.0)
 
     def set_precise(self, precise) -> None:
         """开/关精确传感器；采样线程下一轮就会用上（或停用）它。"""
@@ -303,28 +372,26 @@ class Sampler:
         snap.mem_used = int(mem.total - mem.available)
         snap.mem_total = int(mem.total)
 
-        # GPU 占用按 3D 引擎求和后截断；这是任务管理器的口径，够直观且跨厂商可用。
+        # GPU 占用：同一块卡上的多个 3D 引擎实例求和，但**跨卡取最大**。
+        # 以前把所有适配器的 3D 引擎一起加起来，核显/虚拟显示器一齐跑时数字会虚高。
         engines = self._gpu.collect()
         if engines:
-            total = sum(value for name, value in engines if "engtype_3D" in name)
-            snap.gpu_util = max(0.0, min(100.0, total))
+            per_card = _per_adapter_sum(engines, "engtype_3D")
+            snap.gpu_util = max(0.0, min(100.0, max(per_card.values()))) if per_card else 0.0
 
-        dedicated = self._vram_dedicated.collect()
-        shared = self._vram_shared.collect()
-        dedicated_bytes = int(sum(v for _n, v in dedicated if v > 0)) if dedicated else 0
-        shared_bytes = int(sum(v for _n, v in shared if v > 0)) if shared else 0
-        if dedicated_bytes > 0:
-            snap.vram_used = dedicated_bytes
-            snap.vram_total = self._vram_total
-        elif shared_bytes > 0:
-            snap.vram_used = shared_bytes
-            snap.vram_total = self._vram_total
+        # 显存同理：先按 LUID 分组，再挑"真正在用独占显存"的那块卡。
+        dedicated = {k: v for k, v in _per_adapter_sum(self._vram_dedicated.collect()).items() if v > 0}
+        shared = {k: v for k, v in _per_adapter_sum(self._vram_shared.collect()).items() if v > 0}
+        if dedicated:
+            snap.vram_used = int(dedicated[max(dedicated, key=dedicated.get)])
+            snap.vram_total = self._capacity_for(snap.vram_used)
+        elif shared:
+            snap.vram_used = int(shared[max(shared, key=shared.get)])
+            # 核显/虚拟显示器用的是共享内存，注册表里那点独占显存当分母毫无意义，
+            # 显示"3.5 / 0.1 GB"只会让人困惑，干脆把分母丢掉。
+            snap.vram_total = None
         else:
             snap.vram_used = None
-        # 核显报的是共享用量，而注册表里的容量只是那一小片独占显存，两者不可比。
-        # 与其显示"1.1 / 0.1 GB"这种鬼话，不如把分母丢掉。
-        if snap.vram_total and snap.vram_used and snap.vram_used > snap.vram_total:
-            snap.vram_total = None
 
         snap.gpu_temp = self._nvml.temperature()
         snap.gpu_power = self._nvml.power()
@@ -379,7 +446,14 @@ class Sampler:
         while not self._stop.is_set():
             try:
                 snap = self._sample()
-            except Exception:  # noqa: BLE001 - 单次读取失败不能让叠加层挂掉
-                snap = Snapshot()
+            except Exception as exc:  # noqa: BLE001 - 单次读取失败不能让叠加层挂掉
+                # 沿用上一帧（数字慢一拍）而不是把整条清空成"—"：一次计数器抖动
+                # 不该让用户以为硬件读数全没了。
+                self._failures += 1
+                if self._failures == 1:
+                    pylog.log(f"[tickline] 采样异常，沿用上一帧: {exc!r}")
+                time.sleep(self._interval)
+                continue
+            self._failures = 0
             self._snapshot = snap
             time.sleep(self._interval)
