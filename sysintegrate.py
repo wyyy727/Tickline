@@ -13,8 +13,41 @@ from pathlib import Path
 
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
+# 不声明 argtypes 时 ctypes 会把 HKEY 当 int 传，64 位下句柄会被截断。
+advapi32.RegOpenKeyExW.argtypes = [wt.HKEY, wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.POINTER(wt.HKEY)]
+advapi32.RegOpenKeyExW.restype = wt.LONG
+advapi32.RegCreateKeyExW.argtypes = [
+    wt.HKEY,
+    wt.LPCWSTR,
+    wt.DWORD,
+    wt.LPWSTR,
+    wt.DWORD,
+    wt.DWORD,
+    ctypes.c_void_p,
+    ctypes.POINTER(wt.HKEY),
+    ctypes.POINTER(wt.DWORD),
+]
+advapi32.RegCreateKeyExW.restype = wt.LONG
+advapi32.RegQueryValueExW.argtypes = [
+    wt.HKEY,
+    wt.LPCWSTR,
+    ctypes.c_void_p,
+    ctypes.POINTER(wt.DWORD),
+    ctypes.c_void_p,
+    ctypes.POINTER(wt.DWORD),
+]
+advapi32.RegQueryValueExW.restype = wt.LONG
+advapi32.RegSetValueExW.argtypes = [wt.HKEY, wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD]
+advapi32.RegSetValueExW.restype = wt.LONG
+advapi32.RegDeleteValueW.argtypes = [wt.HKEY, wt.LPCWSTR]
+advapi32.RegDeleteValueW.restype = wt.LONG
+advapi32.RegCloseKey.argtypes = [wt.HKEY]
+advapi32.RegCloseKey.restype = wt.LONG
+
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_VALUE = "Pacelite"
+RUN_VALUE = "Tickline"
+# 更名前（Pacelite）写的自启项。留着会在开机时把旧版本也拉起来，启动时清掉。
+LEGACY_RUN_VALUE = "Pacelite"
 
 HKEY_CURRENT_USER = 0x80000001
 KEY_SET_VALUE = 0x0002
@@ -23,7 +56,13 @@ REG_SZ = 1
 
 
 def pythonw_command() -> str:
-    """自启命令：pythonw + 本程序入口的绝对路径。"""
+    """自启命令。
+
+    打包成 exe 后 sys.executable 就是 Tickline.exe 自己，不能再拼一次入口脚本 ——
+    以前会写出 "Tickline.exe" "Tickline.exe"，开机启动时 argparse 直接报参数错误退出。
+    """
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
     entry = Path(sys.argv[0]).resolve()
     python = Path(sys.executable)
     interpreter = python.with_name("pythonw.exe")
@@ -47,6 +86,19 @@ def autostart_enabled() -> bool:
         ) != 0:
             return False
         return size.value > 0
+    finally:
+        advapi32.RegCloseKey(key)
+
+
+def purge_legacy_autostart() -> None:
+    """删掉更名前的自启项（如果存在）。每次启动调一次，幂等。"""
+    key = wt.HKEY()
+    if advapi32.RegOpenKeyExW(
+        HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, ctypes.byref(key)
+    ) != 0:
+        return
+    try:
+        advapi32.RegDeleteValueW(key, LEGACY_RUN_VALUE)
     finally:
         advapi32.RegCloseKey(key)
 
