@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -31,7 +31,7 @@ from sensors import pawnio_state
 from sysintegrate import autostart_enabled, set_autostart
 from tiers import TIER_NAMES
 
-AUTO_TARGET = "自动（选最忙的出帧进程）"
+AUTO_TARGET = "自动（优先跟随前台游戏）"
 
 
 class HotkeyEdit(QPushButton):
@@ -93,6 +93,7 @@ class SettingsDialog(QDialog):
         on_hotkeys_changed: Callable[[], str | None] | None = None,
         suspend_hotkeys: Callable[[], None] | None = None,
         on_precise_changed: Callable[[bool], str | None] | None = None,
+        on_install_driver: Callable[[], str | None] | None = None,
         on_remove_driver: Callable[[], str | None] | None = None,
     ) -> None:
         super().__init__(None)
@@ -102,11 +103,23 @@ class SettingsDialog(QDialog):
         self._on_hotkeys_changed = on_hotkeys_changed
         self._suspend_hotkeys = suspend_hotkeys
         self._on_precise_changed = on_precise_changed
+        self._on_install_driver = on_install_driver
         self._on_remove_driver = on_remove_driver
         # 构造期间控件会自发信号（setValue/setChecked 等），此时控件还没建全，
         # 让 _push 提前返回，否则会用半成品状态覆盖用户配置。
         self._ready = False
-        self.setWindowTitle("Pacelite 设置")
+        # 拖滑块时 valueChanged 每移 1 像素就发一次，而每次回写都要重建叠加层 + 写盘。
+        # 收敛成 120ms 一次，肉眼无感，磁盘和重绘都省下来了。
+        self._apply_timer = QTimer(self)
+        self._apply_timer.setSingleShot(True)
+        self._apply_timer.setInterval(120)
+        self._apply_timer.timeout.connect(self._flush)
+        self._precise_busy = False
+        self._driver_busy = False
+        self._syncing = False
+        # 关掉就销毁：下次打开设置是全新实例，不会拿着一份过期状态。
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowTitle("Tickline 设置")
         self.setMinimumWidth(360)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
 
@@ -152,6 +165,20 @@ class SettingsDialog(QDialog):
         self.layout_box.currentIndexChanged.connect(self._push)
         form.addRow("布局", self.layout_box)
 
+        self.sparkline_box = QCheckBox("帧时间曲线")
+        self.sparkline_box.setChecked(cfg.sparkline)
+        self.sparkline_box.toggled.connect(self._push)
+        form.addRow("", self.sparkline_box)
+
+        # 刷新间隔越大越省 CPU，但数字变化也越迟钝；100ms 以下对 OLED 屏的残影不友好。
+        self.refresh_spin = QSpinBox()
+        self.refresh_spin.setRange(100, 1000)
+        self.refresh_spin.setSingleStep(50)
+        self.refresh_spin.setValue(cfg.refresh_ms)
+        self.refresh_spin.setSuffix(" ms")
+        self.refresh_spin.valueChanged.connect(self._push)
+        form.addRow("刷新间隔", self.refresh_spin)
+
         # ---- 显示内容 ----
         # 2 列网格，避免六个复选框把窗口拉得很长。
         section_host = QWidget()
@@ -177,14 +204,23 @@ class SettingsDialog(QDialog):
         form.addRow("显示内容", section_host)
 
         # ---- 目标进程 ----
+        # 只允许下拉选择，不给输入框：这个值最终会作为 --process_name 传给 PresentMon，
+        # 一旦存进半截/写错的进程名，一帧都匹配不上，FPS 会永远显示 "—"，且重启还留着。
         self.target_box = QComboBox()
-        self.target_box.setEditable(True)
+        self.target_box.setEditable(False)
         self.target_box.addItem(AUTO_TARGET)
-        for name in sorted(set(presenters or [])):
+        wanted = (cfg.target_process or "").strip()
+        names = sorted(set(presenters or []))
+        if wanted and wanted not in names:
+            # 上次选的进程这次没在出帧：也要列出来，否则下拉框会"看起来"变成了自动，
+            # 用户一碰别的控件就把真实选择覆盖掉。
+            names.insert(0, wanted)
+        for name in names:
             self.target_box.addItem(name)
-        self.target_box.setCurrentText(cfg.target_process or AUTO_TARGET)
-        # 编辑框内容与下拉选择都要回写，所以两个信号都接。
-        self.target_box.currentTextChanged.connect(self._push)
+        index = self.target_box.findText(wanted) if wanted else 0
+        self.target_box.setCurrentIndex(max(0, index))
+        self.target_box.setToolTip("列表里是当前有出帧的进程；列表外的进程选「自动」即可")
+        self.target_box.currentIndexChanged.connect(self._push)
         form.addRow("监视进程", self.target_box)
 
         # ---- 行为 ----
@@ -231,12 +267,24 @@ class SettingsDialog(QDialog):
         self.precise_hint.setWordWrap(True)
         self._refresh_precise_hint()
 
-        # 装过驱动之后要能撤掉，否则"装了个内核驱动"这件事没法反悔。
-        self.remove_driver_button = QPushButton("卸载 PawnIO 驱动")
-        self.remove_driver_button.clicked.connect(self._remove_driver)
+        # 驱动没装时这里必须是"安装"：以前只有一个"卸载"按钮，第一次打开设置的人
+        # 面对一个只能拆、不能装的按钮，根本不知道温度要怎么才出得来。
+        self.driver_button = QPushButton()
+        self.driver_button.clicked.connect(self._driver_clicked)
+
+        # 装驱动是勾选"精确传感器"之外的第二条路，好处得写在这儿，不能指望用户去翻 README。
+        self.driver_hint = QLabel(
+            "装它能读到 CPU 温度（以及主板、硬盘这些走内核的传感器）。\n"
+            "驱动由 LibreHardwareMonitor 使用，只在本机内核里开放传感器读数：不联网、不常驻后台、不写系统目录。\n"
+            "安装时会弹一次管理员授权；不装也能用，只是没有 CPU 温度。"
+        )
+        self.driver_hint.setStyleSheet("color: #888;")
+        self.driver_hint.setWordWrap(True)
+
         driver_row = QHBoxLayout()
-        driver_row.addWidget(self.remove_driver_button)
+        driver_row.addWidget(self.driver_button)
         driver_row.addStretch(1)
+        self._refresh_driver_ui()
 
         # ---- 快捷键 ----
         hotkey_form = QFormLayout()
@@ -258,14 +306,22 @@ class SettingsDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(self.precise_hint)
         layout.addLayout(driver_row)
+        layout.addWidget(self.driver_hint)
         layout.addWidget(QLabel("快捷键"))
         layout.addLayout(hotkey_form)
         layout.addWidget(self.hotkey_hint)
         layout.addLayout(buttons)
-        # 关闭窗口时无论如何重新注册一次，避免"录到一半就关窗"导致热键全失效。
-        self.finished.connect(lambda _code=0: self._reload_hotkeys())
+        # 关闭窗口时：把还悬着的防抖改动落地，再重新注册一次热键，
+        # 避免"录到一半就关窗"导致热键全失效。
+        self.finished.connect(lambda _code=0: self._on_closed())
         # 控件全部就位后才允许回写配置。
         self._ready = True
+
+    def _on_closed(self) -> None:
+        if self._apply_timer.isActive():
+            self._apply_timer.stop()
+            self._apply()
+        self._reload_hotkeys()
 
     def _suspend(self) -> None:
         """进入录键状态前，先把程序占用的全局热键全部让出来。"""
@@ -298,41 +354,153 @@ class SettingsDialog(QDialog):
 
     def _refresh_precise_hint(self) -> None:
         """一行状态，够用户判断为什么没有温度即可。"""
+        state = pawnio_state()
         label = {
-            "running": "驱动就绪",
-            "stopped": "驱动已安装，服务未运行",
-            "missing": "未安装驱动（勾选后需一次管理员授权）",
-        }.get(pawnio_state(), "无法查询驱动状态")
+            "running": "驱动就绪，勾选后即可读 CPU 温度",
+            "stopped": "驱动已安装，但服务没在运行（勾选一次会自动拉起）",
+            "missing": "未安装驱动：点下面的「安装 PawnIO 驱动」，或直接勾选这里（也会装，但只弹一次授权）",
+        }.get(state, "无法查询驱动状态")
         self.precise_hint.setText(label)
+        if hasattr(self, "driver_button"):
+            # 服务被外部停掉/救回来时，按钮文字要跟着系统实际状态走。
+            self._refresh_driver_ui()
+
+    def _set_precise_box(self, value: bool) -> None:
+        """改开关但不把这次改动当成"用户操作"再回调出去。"""
+        self._syncing = True
+        try:
+            self.precise_box.setChecked(value)
+        finally:
+            self._syncing = False
+
+    def _save_precise(self, checked: bool) -> None:
+        self.cfg.precise_sensors = checked
+        self.cfg.save()
 
     def _push_precise(self, checked: bool) -> None:
-        if not self._ready:
+        if not self._ready or self._syncing or self._precise_busy:
             return
         error = None
         if self._on_precise_changed is not None:
             error = self._on_precise_changed(checked)
+        if error == "pending":
+            # 后台正在弹 UAC / 等子进程写出第一份数据（最长 12 秒），
+            # 界面不能卡住，这里先挂"启动中"，结果由 finish_precise() 收尾。
+            self._precise_busy = True
+            self.precise_box.setEnabled(False)
+            self.precise_hint.setStyleSheet("color: #888;")
+            self.precise_hint.setText("正在启动精确传感器（需要管理员授权）…")
+            return
         if error:
             # 失败就把开关拨回去，别让界面显示一个其实没生效的状态。
-            self.precise_box.setChecked(not checked)
+            self._set_precise_box(not checked)
+            self._save_precise(not checked)
             self.precise_hint.setText(error)
             self.precise_hint.setStyleSheet("color: #d9534f;")
             return
-        self.cfg.precise_sensors = checked
-        self.cfg.save()
+        self._save_precise(checked)
         self.precise_hint.setStyleSheet("color: #888;")
         self._refresh_precise_hint()
 
-    def _remove_driver(self) -> None:
-        """卸载驱动：成功后把开关和提示一起刷新回"未安装"状态。"""
-        if self._on_remove_driver is None:
+    def finish_precise(self, error: str | None) -> None:
+        """后台启动结束：成功落配置，失败把开关拨回去并显示原因。"""
+        if not self._precise_busy:
             return
-        error = self._on_remove_driver()
+        self._precise_busy = False
+        self.precise_box.setEnabled(True)
+        if error:
+            self._set_precise_box(False)
+            self._save_precise(False)
+            self.precise_hint.setStyleSheet("color: #d9534f;")
+            self.precise_hint.setText(str(error))
+            return
+        self._set_precise_box(True)
+        self._save_precise(True)
+        self.precise_hint.setStyleSheet("color: #888;")
+        self._refresh_precise_hint()
+
+    # ---- PawnIO 驱动：装/卸是同一个按钮 ------------------------------------
+    def _driver_installed(self) -> bool:
+        """服务在跑或至少装过都算"已安装"；只有查不到才算没装。"""
+        return pawnio_state() in ("running", "stopped")
+
+    def _refresh_driver_ui(self) -> None:
+        installed = self._driver_installed()
+        self.driver_button.setText("卸载 PawnIO 驱动" if installed else "安装 PawnIO 驱动")
+        # 已装的人不需要再读一遍好处，把版面留给状态行。
+        self.driver_hint.setVisible(not installed)
+
+    def _driver_clicked(self) -> None:
+        if self._driver_busy:
+            return
+        if self._driver_installed():
+            self._uninstall_driver()
+        else:
+            self._install_driver()
+
+    def _install_driver(self) -> None:
+        """安装驱动：后台跑（提权 + 服务起来要几秒），结束后刷新按钮文字。"""
+        if self._on_install_driver is None:
+            self.precise_hint.setStyleSheet("color: #d9534f;")
+            self.precise_hint.setText("没有可用的驱动安装入口")
+            return
+        error = self._on_install_driver()
+        if error == "pending":
+            self._driver_busy = True
+            self.driver_button.setEnabled(False)
+            self.precise_hint.setStyleSheet("color: #888;")
+            self.precise_hint.setText("正在安装驱动（需要管理员授权）…")
+            return
         if error:
             self.precise_hint.setStyleSheet("color: #d9534f;")
             self.precise_hint.setText(error)
             return
-        self.precise_box.setChecked(False)
+        self._after_driver_change()
+
+    def _uninstall_driver(self) -> None:
+        """卸载驱动：在后台执行，结束后统一刷新开关和提示。"""
+        if self._on_remove_driver is None or self._driver_busy:
+            return
+        error = self._on_remove_driver()
+        if error == "pending":
+            self._driver_busy = True
+            self.driver_button.setEnabled(False)
+            self.precise_hint.setStyleSheet("color: #888;")
+            self.precise_hint.setText("正在卸载驱动（需要管理员授权）…")
+            return
+        if error:
+            self.precise_hint.setStyleSheet("color: #d9534f;")
+            self.precise_hint.setText(error)
+            return
+        self._set_precise_box(False)
+        self._save_precise(False)
+        self._after_driver_change()
+
+    def _after_driver_change(self) -> None:
+        """装/卸完成后统一收尾：按钮文字、状态行、勾选框都按系统实际状态重新对账。"""
+        self._refresh_driver_ui()
+        if not self._driver_installed():
+            self._set_precise_box(False)
+            self._save_precise(False)
         self.precise_hint.setStyleSheet("color: #888;")
+        self._refresh_precise_hint()
+
+    def finish_driver(self, action: str, error: str | None) -> None:
+        """后台装/卸结束。action 为 "install" 或 "uninstall"。"""
+        if not self._driver_busy:
+            return
+        self._driver_busy = False
+        self.driver_button.setEnabled(True)
+        if error:
+            self.precise_hint.setStyleSheet("color: #d9534f;")
+            self.precise_hint.setText(str(error))
+            self._refresh_driver_ui()
+            return
+        if action == "uninstall":
+            # 驱动没了，精确传感器必然不可用，把开关和配置一起拨回去。
+            self._set_precise_box(False)
+            self._save_precise(False)
+        self._after_driver_change()
         self._refresh_precise_hint()
 
     def _slider_row(self, value: float, minimum: int, maximum: int):
@@ -375,10 +543,16 @@ class SettingsDialog(QDialog):
         self.cfg.click_through = self.click_box.isChecked()
         self.cfg.capture_exclusion = self.capture_box.isChecked()
         self.cfg.show_in_taskbar = self.taskbar_box.isChecked()
+        self.cfg.sparkline = self.sparkline_box.isChecked()
+        self.cfg.refresh_ms = self.refresh_spin.value()
         # 只有用户真的动了这个开关才碰注册表。
         want_autostart = self.autostart_box.isChecked()
         if want_autostart != self.cfg.autostart:
             self.cfg.autostart = want_autostart
             set_autostart(want_autostart)
         self.cfg.clamped()
+        self._apply_timer.start()
+
+    def _flush(self) -> None:
+        """把攒起来的改动真正落地一次：重建叠加层 + 写盘。"""
         self._apply()
