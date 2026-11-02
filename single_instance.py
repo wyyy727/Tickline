@@ -12,7 +12,7 @@ import ctypes.wintypes as wt
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 ERROR_ALREADY_EXISTS = 183
-MUTEX_NAME = "Local\\PaceliteOverlaySingleInstance"
+MUTEX_NAME = "Local\\TicklineOverlaySingleInstance"
 
 
 class SingleInstance:
