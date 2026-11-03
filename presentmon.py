@@ -536,7 +536,9 @@ class PresentMonFeed:
         with self._lock:
             self._prune(now)
             for lane in self._presents.values():
-                for stamp, _ms, name in lane:
+                # 泳道元素是 (到达时刻, 出帧间隔, 进程名, 帧类型) 四元组，别按三元组解包
+                for entry in lane:
+                    stamp, name = entry[0], entry[2]
                     if now - stamp <= 5.0 and name and name.lower() not in COMPOSITOR_PROCESSES:
                         names.add(name)
         return sorted(names)

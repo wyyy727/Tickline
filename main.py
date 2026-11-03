@@ -380,11 +380,20 @@ def main(argv: list[str] | None = None) -> int:
         # 候选进程 = 正在出帧的 + 当前有窗口的，后者让"手动指定"真正可用
         names: set[str] = set()
         if hasattr(feed, "presenters"):
-            names.update(feed.presenters())
+            try:
+                names.update(feed.presenters())
+            except Exception as exc:  # noqa: BLE001 - 候选列表拿不到也要能打开设置
+                pylog.log(f"[settings] 取候选进程失败：{exc!r}")
         try:
             names.update(winprobe.visible_window_processes())
         except Exception:  # noqa: BLE001 - 枚举失败不影响设置窗口打开
             pass
+        # 出帧进程和窗口进程来自两处，大小写写法常常不同（BongoCat.exe / bongocat.exe），
+        # 去重时按小写归一，保留先出现的那个写法。
+        deduped: dict[str, str] = {}
+        for name in sorted(names):
+            deduped.setdefault(name.lower(), name)
+        names = set(deduped.values())
 
         def precise_done(error) -> None:
             dialog = settings_dialog
